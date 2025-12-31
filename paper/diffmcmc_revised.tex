@@ -1,0 +1,290 @@
+
+\documentclass[11pt]{article}
+
+% --- Packages ---
+\usepackage{graphicx}
+\usepackage{amsmath, amsfonts, amssymb}
+\usepackage{mathtools}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{geometry}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\geometry{margin=1in}
+
+% --- Macros ---
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\diag}{\mathrm{diag}}
+\newcommand{\tr}{\mathrm{tr}}
+\newcommand{\divg}{\mathrm{div}}
+\newcommand{\given}{\mid}
+
+\title{DiffMCMC: Flow-Matching Global Proposals with Delayed-Acceptance Metropolis--Hastings}
+\author{Anonymous}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We study \emph{local--global} Markov chain Monte Carlo (MCMC) kernels that combine (i) a robust local
+transition (e.g.\ Random-Walk Metropolis, MALA, or HMC) with (ii) non-local \emph{global} proposals generated
+by a learned transport model. We focus on continuous normalizing flows (CNFs) trained by
+flow matching / rectified flow objectives, which can be fit using standard regression losses and offer fast sampling
+with few ODE steps.
+A practical barrier for using free-form CNFs inside Metropolis--Hastings is the need to evaluate the proposal density
+$q_\phi(x)$, which involves the divergence trace $\tr(\partial v_\phi / \partial x)$ along an ODE trajectory. The common Hutchinson
+trace estimator is unbiased for the trace and for the \emph{log}-density of CNFs, but does \emph{not} yield an unbiased estimator of
+the density itself; naïvely plugging stochastic or approximate log-densities into the acceptance ratio produces a biased Markov chain.
+We therefore propose a \emph{two-stage delayed-acceptance} global move: a cheap surrogate log-density (few Hutchinson probes / coarse solver)
+filters candidates, and only then an exact (or high-fidelity) log-density is computed to restore detailed balance.
+We clarify the exactness conditions, give a concise invariance proof, and provide implementation guidance (caching, mixed proposals, and
+robust diagnostics) that turn CNF-based global proposals into a cohesive, practical sampler.
+\end{abstract}
+
+\section{Introduction}
+
+Modern Bayesian inference requires sampling from targets of the form
+\begin{equation}
+\pi(x) \propto \exp(-U(x)), \qquad x \in \R^D,
+\end{equation}
+where $U(x)$ is an energy (negative log posterior up to a constant). Local MCMC methods (RWMH, MALA, HMC) are asymptotically exact and robust,
+but can mix slowly on multimodal or highly correlated targets. A growing line of work accelerates mixing by learning
+\emph{transport maps} or \emph{global proposals} with normalizing flows or other generative models, then correcting with Metropolis--Hastings
+to retain asymptotic exactness \citep{song2017nice, hoffman2019neutra, gabrie2022adaptive, brofos2022adaptation, wong2023flowmc, samsonov2022localglobal, cabezas2024mfm}.
+
+This note/paper focuses on CNF proposals trained by flow matching / rectified flow \citep{lipman2022flow, liu2022rectified}.
+CNFs allow \emph{free-form} neural vector fields (no coupling-layer constraints) and can be trained with simple regression losses.
+However, when used inside Metropolis--Hastings, we must evaluate the proposal density $q_\phi(x)$ accurately.
+In CNFs, $\log q_\phi(x)$ is obtained by integrating a divergence trace along an ODE trajectory \citep{chen2018neural, grathwohl2018ffjord}.
+Estimating the trace by Hutchinson is scalable but introduces stochasticity and approximation error.
+A core contribution of this revision is to make the exactness story precise and to provide a practical remedy:
+\emph{delayed acceptance} global moves \citep{christen2005approx}.
+
+\paragraph{Contributions (revised).}
+\begin{itemize}
+    \item We formalize a local--global MCMC kernel that interleaves a standard local sampler with independence proposals from a CNF trained by flow matching / rectified flow.
+    \item We show explicitly why using an \emph{approximate} proposal density (including ``fixed-noise'' Hutchinson) in the MH ratio yields a \emph{biased} stationary distribution.
+    \item We propose a two-stage delayed-acceptance global kernel that uses a cheap surrogate density to prefilter and an exact (or high-fidelity) density to restore detailed balance.
+    \item We give implementation guidance that makes the method practical: caching of log-densities, tail-safe mixture proposals, and diagnostics beyond i.i.d.\ goodness-of-fit tests.
+\end{itemize}
+
+\section{Background}
+
+\subsection{Metropolis--Hastings and independence proposals}
+
+Let $\pi$ be the target density (known up to a constant). Given a proposal kernel $q(x' \given x)$, Metropolis--Hastings accepts a proposal $x'$
+from current state $x$ with probability
+\begin{equation}
+\alpha(x,x') = \min\!\left(1, \frac{\pi(x')\, q(x \given x')}{\pi(x)\, q(x' \given x)}\right).
+\end{equation}
+The resulting chain is $\pi$-reversible (and hence $\pi$-invariant) under mild conditions.
+
+In this work the global proposal is typically an \emph{independence} proposal: $q(x' \given x) = q_\phi(x')$.
+The acceptance simplifies to
+\begin{equation}\label{eq:imh}
+\alpha_{\text{IMH}}(x,x') = \min\!\left(1, \frac{\pi(x')\, q_\phi(x)}{\pi(x)\, q_\phi(x')}\right).
+\end{equation}
+Independence MH is particularly effective when $q_\phi$ approximates $\pi$ well \citep{brofos2022adaptation}.
+
+\subsection{Continuous normalizing flows and divergence traces}
+
+A CNF defines an invertible map via an ODE
+\begin{equation}
+\frac{d x_t}{dt} = v_\phi(x_t,t), \qquad t \in [0,1], \qquad x_0 \sim p_0,
+\end{equation}
+and sets $x_1 \sim q_\phi$ as the proposal distribution. The instantaneous change-of-variables formula gives
+\begin{equation}\label{eq:cnf_logp}
+\frac{d}{dt}\log q_t(x_t) = -\divg v_\phi(x_t,t) = -\tr\!\left(\frac{\partial v_\phi(x_t,t)}{\partial x_t}\right),
+\end{equation}
+so
+\begin{equation}\label{eq:cnf_logq}
+\log q_\phi(x_1) = \log p_0(x_0) - \int_0^1 \tr\!\left(\frac{\partial v_\phi(x_t,t)}{\partial x_t}\right)\, dt.
+\end{equation}
+Computing $\tr(\partial v/\partial x)$ exactly is typically $O(D)$ reverse/forward-mode passes per ODE evaluation (or worse if done naïvely),
+so scalable CNFs often estimate the trace with Hutchinson \citep{hutchinson1989stochastic, grathwohl2018ffjord}:
+\begin{equation}\label{eq:hutch}
+\tr(J) = \E_{\varepsilon}\big[\varepsilon^\top J\, \varepsilon \big], \qquad \varepsilon_i \in \{\pm1\} \text{ i.i.d.}
+\end{equation}
+With $K$ probes we use $\widehat{\tr}(J)=\frac{1}{K}\sum_{k=1}^K \varepsilon_k^\top J \varepsilon_k$.
+
+\section{DiffMCMC: local--global kernel}
+
+We define a mixture transition
+\begin{equation}\label{eq:mixture}
+K(x,dx') = (1-\beta)\,K_{\text{loc}}(x,dx') + \beta\,K_{\text{glob}}(x,dx'),
+\end{equation}
+where $K_{\text{loc}}$ is any $\pi$-invariant local kernel (RWMH/MALA/HMC) and $K_{\text{glob}}$ is a $\pi$-invariant global kernel based on
+independence proposals from $q_\phi$. If both components leave $\pi$ invariant then the mixture does as well.
+
+\subsection{Global kernel with exact $q_\phi$}
+
+If we can evaluate $q_\phi(x)$ (up to a constant) exactly, the global kernel is simply independence MH:
+propose $x' \sim q_\phi(\cdot)$ and accept with \eqref{eq:imh}.
+
+\subsection{Key pitfall: approximate proposal densities bias MH}
+
+In CNFs, $\log q_\phi(x)$ is often \emph{approximated} using (i) numerical ODE integration, and (ii) a stochastic trace estimator.
+It is tempting to fix randomness (e.g.\ ``hash the state to a seed'') so that $\widehat{\log q_\phi(x)}$ becomes deterministic and can be reused.
+However, deterministic \emph{does not} imply \emph{correct}.
+
+\paragraph{Proposition 1 (stationary distribution under a surrogate proposal density).}
+Let the implemented proposal draw $x' \sim q(x')$ (independence proposal), but the MH acceptance probability is computed using a positive surrogate
+density $\tilde q$:
+\begin{equation}\label{eq:wrong_accept}
+\tilde\alpha(x,x') = \min\!\left(1, \frac{\pi(x')\,\tilde q(x)}{\pi(x)\,\tilde q(x')}\right).
+\end{equation}
+Then the resulting Markov chain is reversible with respect to
+\begin{equation}\label{eq:pi_wrong}
+\tilde\pi(x) \propto \pi(x)\, \frac{q(x)}{\tilde q(x)},
+\end{equation}
+and in general $\tilde\pi \neq \pi$ unless $\tilde q \equiv q$ (almost everywhere).
+
+\emph{Sketch.} For $x\neq x'$, detailed balance holds for \eqref{eq:pi_wrong} because the acceptance ratio uses $\tilde q$ while proposals use $q$; the
+standard independence-MH proof carries through with the modified weight $q/\tilde q$.
+
+\paragraph{Implication.}
+Using ``fixed-noise Hutchinson'' inside the acceptance ratio is not an exactness guarantee: it merely selects a particular deterministic surrogate $\tilde q$.
+If the surrogate differs from the true proposal density, the chain targets \eqref{eq:pi_wrong}, not $\pi$. This is an instance of \emph{noisy/approximate MCMC}
+\citep{andrieu2009pseudo, alquier2016noisy}.
+
+\subsection{Delayed acceptance fixes the pitfall}
+
+We now define a two-stage global kernel that uses a cheap surrogate only as a \emph{prefilter}, then corrects to the exact MH ratio.
+This is a special case of delayed-acceptance MCMC \citep{christen2005approx}.
+
+Let $\tilde q$ be a cheap approximation of $q$ (e.g.\ few Hutchinson probes + coarse solver), and let $q$ be the exact (or high-fidelity) proposal density.
+From current state $x$:
+\begin{enumerate}
+\item Propose $x' \sim q(\cdot)$.
+\item Stage 1 (cheap): accept with
+\begin{equation}
+\alpha_1(x,x') = \min\!\left(1, \frac{\pi(x')\,\tilde q(x)}{\pi(x)\,\tilde q(x')}\right).
+\end{equation}
+If rejected, stay at $x$ and stop.
+\item Stage 2 (correction): compute $q(x')$ and accept with
+\begin{equation}\label{eq:alpha2}
+\alpha_2(x,x') = \min\!\left(1, \frac{q(x)\,\tilde q(x')}{q(x')\,\tilde q(x)}\right).
+\end{equation}
+\end{enumerate}
+
+\paragraph{Proposition 2 (exactness of delayed-acceptance global moves).}
+Assume $q$ is the true proposal density used to generate $x'$. Then the resulting two-stage global kernel $K_{\text{glob}}$
+is $\pi$-reversible, hence $\pi$-invariant.
+
+\emph{Sketch.} The product of acceptance ratios is the exact IMH ratio:
+\[
+\frac{\pi(x')\tilde q(x)}{\pi(x)\tilde q(x')}\cdot
+\frac{q(x)\tilde q(x')}{q(x')\tilde q(x)}
+=
+\frac{\pi(x')q(x)}{\pi(x)q(x')}.
+\]
+Delayed acceptance constructs an acceptance rule that preserves detailed balance but reduces expensive evaluations by rejecting early
+under the surrogate \citep{christen2005approx}.
+
+\section{Implementation guidance}
+
+\subsection{Two log-density evaluators and caching}
+
+Implement two functions:
+\begin{itemize}
+    \item \texttt{log\_q\_cheap(x)}: uses a coarse ODE solver grid and small $K$ (often $K{=}1$) Hutchinson probes.
+    \item \texttt{log\_q\_exact(x)}: computes $\log q(x)$ accurately. Options:
+    \begin{enumerate}
+        \item \emph{Exact trace} for moderate $D$: compute $\divg v = \sum_{i=1}^D \partial v_i/\partial x_i$ (vectorized over basis vectors).
+        \item \emph{High-fidelity Hutchinson}: larger $K$ and/or variance reduction; note this is still approximate and should not be advertised as ``exact'' unless
+        the remaining error is demonstrably negligible for the application.
+    \end{enumerate}
+\end{itemize}
+Cache $(\log \tilde q(x), \log q(x), \log \pi(x))$ at the current state so that stage 2 only needs to compute expensive quantities for $x'$.
+
+\subsection{Tail-safe proposal mixtures}
+
+To avoid catastrophic rejection when $q_\phi$ under-covers the tails, use a mixture proposal for global moves:
+\[
+q_{\text{mix}}(x) = (1-\eta)\,q_\phi(x) + \eta\,r(x),
+\]
+where $r$ is a broad reference (e.g.\ the base $p_0$ pushed through a shallow map, or a wide Gaussian).
+Then compute $q_{\text{mix}}$ (and its surrogate) in the MH ratio. This is standard practice for robust independence proposals.
+
+\subsection{Diagnostics: avoid i.i.d.\ tests on autocorrelated chains}
+
+Classical goodness-of-fit tests such as KS assume i.i.d.\ samples and can be misleading on correlated MCMC output. Prefer diagnostics that account for
+autocorrelation (ESS, integrated autocorrelation time) and discrepancy measures designed for dependent samples such as kernel Stein discrepancy (KSD),
+or simulation-based calibration when a generative model for the prior predictive is available \citep{cabezas2024mfm}.
+
+\section{Algorithm}
+
+\begin{algorithm}[H]
+\caption{DiffMCMC with Delayed-Acceptance Global Proposals}
+\begin{algorithmic}[1]
+\State \textbf{Input:} initial $x_0$, mixture weight $\beta$, surrogate $\tilde q$, exact $q$, local kernel $K_{\text{loc}}$
+\State Precompute and cache $\log \pi(x_0)$, $\log \tilde q(x_0)$, and (optionally) $\log q(x_0)$
+\For{$t=0,1,2,\dots$}
+    \State Draw $u \sim \mathrm{Uniform}(0,1)$
+    \If{$u < \beta$} \Comment{global move}
+        \State Sample $x' \sim q(\cdot)$ via CNF forward solve
+        \State Compute $\log \pi(x')$ and $\log \tilde q(x')$
+        \State $\log r_1 \gets \log \pi(x') - \log \pi(x_t) + \log \tilde q(x_t) - \log \tilde q(x')$
+        \If{$\log u_1 < \min(0,\log r_1)$ for $u_1\sim U(0,1)$} \Comment{stage 1 accept}
+            \State Compute $\log q(x')$ (and ensure $\log q(x_t)$ is cached)
+            \State $\log r_2 \gets \log q(x_t) - \log q(x') + \log \tilde q(x') - \log \tilde q(x_t)$
+            \If{$\log u_2 < \min(0,\log r_2)$ for $u_2\sim U(0,1)$} \Comment{stage 2 accept}
+                \State $x_{t+1} \gets x'$ and update cache
+            \Else
+                \State $x_{t+1} \gets x_t$
+            \EndIf
+        \Else
+            \State $x_{t+1} \gets x_t$
+        \EndIf
+    \Else \Comment{local move}
+        \State Sample $x_{t+1} \sim K_{\text{loc}}(x_t,\cdot)$ (standard MH-corrected local step)
+        \State Update cache values for $x_{t+1}$
+    \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\section{Training the CNF proposal}
+
+DiffMCMC requires a proposal $q_\phi$ from which we can sample and (eventually) evaluate $\log q_\phi(x)$.
+A practical route is to fit $q_\phi$ to approximate $\pi$ using samples gathered during an initial local warm-up phase, then freeze $\phi$.
+More ambitious adaptive schemes update $\phi$ on the fly under diminishing adaptation conditions \citep{brofos2022adaptation, cabezas2024mfm}.
+Rectified flow training \citep{liu2022rectified} is appealing here because it reduces to supervised regression on interpolated pairs and tends to yield
+straighter trajectories that can be simulated with fewer function evaluations.
+
+\section{Experiments}
+
+\subsection{Real-World Application: Photonic Thin-Film Inference}
+
+We demonstrate the efficacy of the proposed method on a representative real-world Bayesian inference problem: reconstructing the layer thicknesses of a 10-layer photonic thin-film structure from its reflectance spectrum. This inverse problem is characterized by a multimodal energy landscape and periodic correlations due to interference effects.
+
+\paragraph{Setup.} The target is a 10-layer structure ($D=10$) modeled by the Transfer Matrix Method. We employ an independence flow proposal trained on samples from a pilot RWMH run. The global proposal uses a mixture weight $\eta=0.05$ and the delayed-acceptance mechanism with a `cheap' surrogate (1 Hutchinson probe, coarse ODE steps) filtering candidates before the `exact' evaluation.
+
+\paragraph{Results.} Figure~\ref{fig:photonic} displays the inference results. The sampler successfully explores the posterior, recovering the ground truth spectral response (Top-Left). The trace plots (Top-Right) and pairwise scatter plots (Bottom-Left) demonstrate that the global moves enable efficient transitions across the parameter space, capturing the correlation structure without getting trapped in local minima. The relative error of the posterior means (Bottom-Right) remains low across all dimensions.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{figures/photonic_results.png}
+    \caption{Inference results on the 10-layer photonic thin-film problem. (Top-Left) Reconstructed spectrum vs.\ ground truth. (Top-Right) Trace plot of Layer 1 thickness. (Bottom-Left) Posterior marginals for Layer 1 vs Layer 2. (Bottom-Right) Relative error of mean estimates per layer.}
+    \label{fig:photonic}
+\end{figure}
+
+\section{Conclusion}
+
+The core idea---learning a global proposal with flow matching / rectified flow and correcting it with MH---is powerful, but the \emph{implementation details}
+determine whether the resulting chain is exact or biased. This revision makes the exactness conditions explicit and upgrades the method with delayed acceptance,
+turning Hutchinson-based log-density estimators into safe, useful surrogates rather than a source of silent bias.
+Future work should focus on reliable online adaptation, tempering for mode discovery, and careful benchmarking against state-of-the-art local--global samplers.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

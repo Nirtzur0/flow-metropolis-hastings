@@ -22,7 +22,7 @@ def test_gaussian_1d_ks():
     # Note: Even if Flow is untrained/random, proper MH should correct it to N(0,1).
     # This is the ultimate test of "Robustness" & "Exactness".
     
-    flow = FlowProposal(dim, deterministic_trace=True) # Deterministic for rigor
+    flow = FlowProposal(dim, step_size=0.05, deterministic_trace=True, mixture_prob=0.2, broad_scale=2.0) # Mixture for robustness
     
     sampler = DiffusionMH(
         log_prob_fn=log_prob,

@@ -2,7 +2,9 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from diffmcmc.core.kernels import AbstractKernel
+from diffmcmc.diagnostics.metrics import compute_ess
 from typing import Callable, Optional, Tuple, Dict, Any
+import time
 
 class DiffusionMH:
     """
@@ -41,7 +43,32 @@ class DiffusionMH:
              current_lq = self.global_proposal.log_prob(current_x.unsqueeze(0)).squeeze(0)
 
         chain = []
-        stats = {"accept_local": 0, "accept_global": 0, "attempts_local": 0, "attempts_global": 0}
+        stats = {
+            "accept_local": 0, 
+            "accept_global": 0, 
+            "accept_global_stage1": 0,
+            "attempts_local": 0, 
+            "attempts_global": 0,
+            "total_time_sec": 0.0,
+            "ess_min": 0.0,
+            "ess_per_sec": 0.0
+        }
+        
+        # Caching for global moves
+        # current_lq_cheap and current_lq_exact are valid only if current_x hasn't changed since last global computation,
+        # OR if we update them.
+        # Strategically: We compute them on demand.
+        # But if we just did a global move, we have them.
+        # If we did a local move, they are invalid.
+        # Actually, for DA stage 2, we need log_q_exact(current_x).
+        # We should cache it.
+        
+        cache = {
+            "log_q_cheap": None,
+            "log_q_exact": None
+        }
+        
+        start_time = time.time()
         
         iterator = tqdm(range(num_steps + warmup), desc="Sampling")
         for step in iterator:
@@ -59,35 +86,76 @@ class DiffusionMH:
                 # q(x') independent of x
                 try:
                     proposed_x = self.global_proposal.sample(1).squeeze(0) # (D,)
-                    # Depending on implementation, sample might return on same device or CPU. Ensure device match.
                     if proposed_x.device != current_x.device:
                         proposed_x = proposed_x.to(current_x.device)
 
-                    proposed_lq = self.global_proposal.log_prob(proposed_x.unsqueeze(0)).squeeze(0)
+                    # --- STAGE 1: Cheap Evaluation ---
+                    proposed_lq_cheap = self.global_proposal.log_prob_cheap(proposed_x.unsqueeze(0)).squeeze(0)
                     proposed_lp = self.log_prob_fn(proposed_x)
                     
-                    # MH Ratio:
-                    # alpha = min(1, (pi(x') * q(x)) / (pi(x) * q(x')))
-                    # log_alpha = log_pi(x') + log_q(x) - log_pi(x) - log_q(x')
-                    
-                    # NOTE: current_lq needs to be valid. If it's None (first step or model changed), compute it.
-                    if current_lq is None:
-                        current_lq = self.global_proposal.log_prob(current_x.unsqueeze(0)).squeeze(0)
+                    # Ensure current_lq_cheap is available
+                    if cache["log_q_cheap"] is None:
+                        cache["log_q_cheap"] = self.global_proposal.log_prob_cheap(current_x.unsqueeze(0)).squeeze(0)
+                    current_lq_cheap = cache["log_q_cheap"]
                         
-                    log_alpha = proposed_lp + current_lq - current_lp - proposed_lq
+                    # Stage 1 MH Ratio (using cheap q)
+                    # log_alpha_1 = log_pi(x') - log_pi(x) + log_q_cheap(x) - log_q_cheap(x')
+                    log_r1 = proposed_lp - current_lp + current_lq_cheap - proposed_lq_cheap
+                    log_alpha_1 = min(0, log_r1.item())
                     
-                    if torch.log(torch.rand(1).to(self.device)) < log_alpha:
-                        current_x = proposed_x
-                        current_lp = proposed_lp
-                        current_lq = proposed_lq
-                        accepted = True
+                    # Standard DA check
+                    if torch.log(torch.rand(1).to(self.device)) < log_alpha_1:
+                        stats["accept_global_stage1"] += 1
+                        
+                        # --- STAGE 2: Exact Evaluation ---
+                        # Only compute expensive stuff now
+                        proposed_lq_exact = self.global_proposal.log_prob_exact(proposed_x.unsqueeze(0)).squeeze(0)
+                        
+                        if cache["log_q_exact"] is None:
+                            cache["log_q_exact"] = self.global_proposal.log_prob_exact(current_x.unsqueeze(0)).squeeze(0)
+                        current_lq_exact = cache["log_q_exact"]
+                        
+                        # Stage 2 MH Ratio Correction
+                        # log_alpha_2 = min(0, log_r_true) - log_alpha_1
+                        # where log_r_true = log_pi(x') - log_pi(x) + log_q_exact(x) - log_q_exact(x')
+                        
+                        log_r_true = proposed_lp - current_lp + current_lq_exact - proposed_lq_exact
+                        log_alpha_true = min(0, log_r_true.item())
+                        
+                        # Probability of acceptance at stage 2
+                        # alpha_2 = alpha_true / alpha_1
+                        # log_alpha_2 = log_alpha_true - log_alpha_1
+                        log_alpha_2 = log_alpha_true - log_alpha_1
+                        
+                        # Numerical safety check (should be <= 0)
+                        if log_alpha_2 > 1e-6:
+                             # This can happen due to float errors or if alpha_1 was very small but alpha_true is large?
+                             # Theoretically alpha_2 <= 1 -> log <= 0.
+                             # But if cheap rejected it should have rejected.
+                             # If cheap accepted (alpha_1 < 1), and true accepts (alpha_true=1), then alpha_2 > 1?
+                             # Wait. alpha_true <= 1. alpha_1 <= 1.
+                             # If alpha_1 = 0.5, alpha_true = 0.8. alpha_2 = 1.6 > 1?
+                             # In that case, we accept with probability 1 (min(1, 1.6)).
+                             # So log_alpha_2 should be capped at 0.
+                             pass
+                             
+                        if torch.log(torch.rand(1).to(self.device)) < log_alpha_2:
+                            current_x = proposed_x
+                            current_lp = proposed_lp
+                            accepted = True
+                            
+                            # Update Cache
+                            cache["log_q_cheap"] = proposed_lq_cheap
+                            cache["log_q_exact"] = proposed_lq_exact
+                            
+                    else:
+                        # Stage 1 rejected
+                        pass
+
                 except RuntimeError as e:
-                     # Catch specific runtime errors (e.g. numerical stability in flow)
-                    print(f"Global move warning: {e}")
-                    accepted = False
+                     print(f"Global move warning: {e}")
+                     accepted = False
                 except Exception as e:
-                    # For other unexpected errors, we should likely raise or log seriously.
-                    # Retaining print for now but making it clearer it's a critical failure in proposal.
                     print(f"Global move failed unexpectedly: {e}")
                     accepted = False
 
@@ -107,10 +175,10 @@ class DiffusionMH:
                 if torch.log(torch.rand(1).to(self.device)) < log_alpha:
                     current_x = proposed_x
                     current_lp = proposed_lp
-                    # If we moved locally, current_lq is now invalid for the NEW x
-                    # We can lazily recompute it only when the next global move happens, 
-                    # OR compute it now. Lazy is better for performance if p_global is low.
-                    current_lq = None 
+                    # If we moved locally, current_lq is now invalid for the NEW x.
+                    # Invalidate cache.
+                    cache["log_q_cheap"] = None
+                    cache["log_q_exact"] = None
                     accepted = True
                     
                 if accepted: stats["accept_local"] += 1
@@ -118,4 +186,14 @@ class DiffusionMH:
             if step >= warmup:
                 chain.append(current_x.detach().cpu().numpy())
                 
-        return np.array(chain), stats
+        total_time = time.time() - start_time
+        stats["total_time_sec"] = total_time
+        
+        chain_arr = np.array(chain)
+        if len(chain_arr) > 0:
+            ess = compute_ess(chain_arr)
+            min_ess = np.min(ess)
+            stats["ess_min"] = float(min_ess)
+            stats["ess_per_sec"] = float(min_ess / (total_time + 1e-9))
+        
+        return chain_arr, stats

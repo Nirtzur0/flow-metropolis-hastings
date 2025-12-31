@@ -96,8 +96,10 @@ def run_experiment():
     # Use the end of the chain where it likely converged
     buffer_samples = s_rwm[2000::5].astype(np.float32)
     
-    flow = FlowProposal(dim, deterministic_trace=True)
-    train_flow_matching(flow, buffer_samples, epochs=150, batch_size=256, verbose=False)
+    # Use mixture to ensure robustness
+    # Delayed Acceptance is enabled by default via deterministic_trace=True, but we can tune it.
+    flow = FlowProposal(dim, step_size=0.1, deterministic_trace=True, mixture_prob=0.05, broad_scale=2.0)
+    train_flow_matching(flow, buffer_samples, epochs=500, batch_size=256, verbose=False)
     
     diff = DiffusionMH(
         target.log_prob,
